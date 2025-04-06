@@ -117,7 +117,7 @@ REMOTE_BACKUP_DIR="/var/db/postgres1/backups/$(date +%Y-%m-%d_%H-%M-%S)"
 # Создание директории на основном узле
 mkdir -p $LOCAL_BACKUP_DIR
 # Создание директории на резервном узле
-ssh postgres1@pg114 "mkdir -p $REMOTE_BACKUP_DIR"
+ssh pg1 "mkdir -p $REMOTE_BACKUP_DIR"
 
 # Выполнение резервного копирования на основном узле
 pg_basebackup -D $LOCAL_BACKUP_DIR -Ft -z -Xs -P -U replicator -h pg109 -p 9455
@@ -125,7 +125,7 @@ pg_basebackup -D $LOCAL_BACKUP_DIR -Ft -z -Xs -P -U replicator -h pg109 -p 9455
 if [ $? -eq 0 ]; then
   echo "Резервное копирование успешно завершено на основном узле: $LOCAL_BACKUP_DIR"
   # Копирование резервной копии на резервный узел
-  scp -r $LOCAL_BACKUP_DIR/* postgres1@pg114:$REMOTE_BACKUP_DIR/
+  scp -r $LOCAL_BACKUP_DIR/* pg1:$REMOTE_BACKUP_DIR/
   # Проверка успешности копирования
   if [ $? -eq 0 ]; then
     echo "Резервная копия успешно перенесена на резервный узел: $REMOTE_BACKUP_DIR"
@@ -133,7 +133,7 @@ if [ $? -eq 0 ]; then
     find /var/db/postgres0/backups -type d -mtime +7 -exec rm -rf {} \;
     echo "Старые резервные копии удалены на основном узле"
     # Удаление старых резервных копий на резервном узле (старше 4 недель)
-    ssh postgres1@pg114 "find /var/db/postgres1/backups -type d -mtime +28 -exec rm -rf {} \;"
+    ssh pg1 "find /var/db/postgres1/backups -type d -mtime +28 -exec rm -rf {} \;"
     echo "Старые резервные копии удалены на резервном узле"
   else
     echo "Ошибка при переносе резервной копии на резервный узел"
@@ -225,11 +225,73 @@ psql -h pg109 -p 9455 -U new_user -d leftbrownmom
 ```
 #image("img/img_5.png")
 == Этап 4. Логическое повреждение данных
+
+== Настраиваем архивирование и добавляем данные
+
+Восстановим и запустим кластер
+```
+pg_resetwal -f ~/u08/dsj10
+pg_ctl start
+```
+
+Включим архивирование
+
 ```sh
 archive_mode = on
-archive_command = 'scp %p postgres1@pg114:/var/db/postgres1/wal_archive/%f'
+archive_command = 'scp %p pg1:/var/db/postgres1/wal_archive/%f'
 archive_timeout = 60
 restore_command = 'cp /var/db/postgres1/u08/djs10/pg_wal/%f %p'
 ```
 
+Добавим строки в таблицы и зафиксируем время изменения
+
+```sql
+insert into test_table1 (data) values ('Test data 666');
+```
+
+#image("img/part4_img1.png")
+
+== Симулируем ошибку
+
+Удалим половину строк в таблице
+
+```sql
+DELETE FROM test_table1 data
+WHERE id IN (
+    SELECT id
+    FROM (
+    SELECT id, row_number() OVER (ORDER BY id) AS row_num
+    FROM test_table1
+) AS subquery
+WHERE row_num % 2 = 0
+);
+```
+
+#image("img/part4_img2.png")
+
+== Восстанавливаем данные
+
+Остановим сервер
+
+```sh
+pg_ctl stop
+```
+
+Создадим в директории кластера файл, сигнализирующий о восстановлении:
+
+На резервном узле:
+```sh
+touch ~/u08/djs10/recovery.signal
+```
+
+Добавим в postgresql.conf
+
+```sh
+echo "restore_command = 'cp /var/db/postgres1/u08/djs10/%f %p'">>~/u08/djs10/postgresql.conf
+echo "recovery_target_time = '2025-04-07 01:47:21.828098+03'" >>~/u08/djs10/postgresql.conf
+```
+
 = Вывод
+
+В ходе выполнения данной лабораторной работы мы настроили создание бекапов postgresql, и испытали при различных условиях:
+полной потери основного узла, повреждении файлов БД или логического повреждения данных.

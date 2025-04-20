@@ -159,6 +159,38 @@ crontab -e
 
 === Подсчет объемов и анализ результатов
 
+Условия:
+- Средний объем новых данных в БД за сутки: 350МБ.
+- Средний объем измененных данных за сутки: 800МБ.
+
+==== Расчет размеров бекапов
+
+В сутки будет $350$ МБайт новых данных
+
+Воспользуемся арифметической прогрессией
+
+$ S_"back" = (2*0 + 350 * (30-1))/2 * 30 = 152250 "МБ" = 149 "ГБ"  $
+
+Размер бекапов за месяц  - 149 Гб
+
+==== Расчет размеров wal архивов
+
+wal_segsize = 16 Мб
+
+Объем изменений - 800 Мб -> 50 cегментов = размер wal_archive за сутки - 800Мб
+
+$ S_"wal" = ((30-1) * 800) / 2 * 30 = 348000 "Мб" = 340 "Гб" $
+
+==== Итоговый размер
+
+$ S = S_"backup" + S_"wal" = 340 + 149 = 489 "Гб" $
+
+Итого через месяц получаем 489 Гб бекапов
+
+
+
+
+
 == Этап 2. Потеря основного узла
 Для восстановления воссоздадим файловую структуру кластера и табличного
 пространства на резервном узле из нашего бэкапа:
@@ -228,68 +260,121 @@ psql -h pg109 -p 9455 -U new_user -d leftbrownmom
 
 == Настраиваем архивирование и добавляем данные
 
-Восстановим и запустим кластер
-```
-pg_resetwal -f ~/u08/dsj10
-pg_ctl start
-```
-
-Включим архивирование
-
-```sh
-archive_mode = on
-archive_command = 'scp %p pg1:/var/db/postgres1/wal_archive/%f'
-archive_timeout = 60
-restore_command = 'cp /var/db/postgres1/u08/djs10/pg_wal/%f %p'
-```
-
-Добавим строки в таблицы и зафиксируем время изменения
+==== Создадим таблицу с внешними ключами
 
 ```sql
-insert into test_table1 (data) values ('Test data 666');
-```
+CREATE TABLE IF NOT EXISTS students (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL
+);
 
-#image("img/part4_img1.png")
-
-== Симулируем ошибку
-
-Удалим половину строк в таблице
-
-```sql
-DELETE FROM test_table1 data
-WHERE id IN (
-    SELECT id
-    FROM (
-    SELECT id, row_number() OVER (ORDER BY id) AS row_num
-    FROM test_table1
-) AS subquery
-WHERE row_num % 2 = 0
+CREATE TABLE IF NOT EXISTS lessons (
+  id SERIAL PRIMARY KEY,
+  student_id INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  FOREIGN KEY (student_id) REFERENCES students(id)
 );
 ```
 
-#image("img/part4_img2.png")
+==== Добавим тестовые записи
 
-== Восстанавливаем данные
-
-Остановим сервер
-
-```sh
-pg_ctl stop
+```sql
+INSERT INTO students (name) VALUES
+  ('Азат'),
+  ('Ульяна');
+INSERT INTO lessons (student_id, title) VALUES
+  ((SELECT id FROM students WHERE name='Азат'), 'РСХД азат'),
+  ((SELECT id FROM students WHERE name='Ульяна'), 'РСХД ульяна');
 ```
 
-Создадим в директории кластера файл, сигнализирующий о восстановлении:
+Посмотрим что получилось:
 
-На резервном узле:
-```sh
-touch ~/u08/djs10/recovery.signal
+```sql
+SELECT * from lessons join students on (student_id = students.id);
 ```
 
-Добавим в postgresql.conf
+#image("img/select_result_4.png")
+
+==== Зафиксируем время изменений
+
+#image("img/error_time.png")
+
+==== Создание дампа
+
+Сделаем скрипт create_dump.sh
 
 ```sh
-echo "restore_command = 'cp /var/db/postgres1/u08/djs10/%f %p'">>~/u08/djs10/postgresql.conf
-echo "recovery_target_time = '2025-04-07 01:47:21.828098+03'" >>~/u08/djs10/postgresql.conf
+#!/bin/bash
+
+dumps_dir="${HOME}/dumps/"
+dump_name="db-$(date +"%m-%d-%Y-%H-%M-%S").dump"
+
+pg_dump -h pg109 -p 9455 -d leftbrownmom -U new_user -Fc > $dumps_dir$dump_name
 ```
+
+Добавим права на исполнение и исполним
+
+```sh
+chmod +x ${HOME}/create_dump.sh
+mkdir dumps
+bash ./create_dump.sh
+```
+
+==== Иммитация порчи данных
+
+```sql
+ALTER TABLE lessons DROP CONSTRAINT lessons_student_id_fkey;
+
+UPDATE lessons
+  SET student_id = 10000
+WHERE id IN (
+  SELECT id FROM lessons LIMIT 1
+);
+
+DELETE FROM students where name = 'Ульяна';
+```
+
+Посмотрим что получилось:
+
+```sql
+SELECT * from lessons join students on (student_id = students.id);
+```
+
+#image("img/select_result_after_drop.png")
+
+==== Восстановление данных
+
+Создадим скрипт
+```sh
+#!/bin/bash
+
+dumps_dir="dumps/"
+
+dump_name=$1
+
+rsync --rsync-path=/usr/local/bin/rsync --archive postgres0@pg109:~/$dumps_dir$dump_name ~/
+pg_restore -h pg114 -p 9455 -d leftbrownmom -U new_user -c $dump_name -v
+rm -rf $dump_name
+```
+
+Выдадим разрешения и исполним
+```sh
+chmod +x ./restore_dump.sh
+
+bash ./restore_dump.sh db-04-21-2025-02-03-47.dump
+```
+
+#image("img/restore_result.png")
+
+Посмотрим что мы увидим в таблице
+
+```sql
+SELECT * from lessons join students on (student_id = students.id);
+```
+
+#image("img/restore_result_tables.png")
+
+Итого: данные удалось восстановить
 
 = Вывод
 
